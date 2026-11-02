@@ -1,0 +1,94 @@
+# Renders a Remotion composition in parallel: each matrix job renders one frame range, then a final job
+# concatenates the parts losslessly (all parts share codec settings) and muxes in the audio track if present.
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: Remotion composition id
+        default: BridgeShort
+      parts:
+        description: Number of parallel parts (max 20 on the free plan)
+        default: "15"
+      scale:
+        description: Output scale (0.5 = preview 540x960, 1.3333 = final 1440x2560)
+        default: "1.3333"
+      audio:
+        description: Optional audio file in the repo to mux in (e.g. public/audio/mix.wav)
+        default: ""
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ranges: ${{ steps.split.outputs.ranges }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}", cache: npm }
+      - run: npm ci
+      - id: split
+        name: Split the composition into frame ranges
+        run: |
+          total=$(node scripts/total-frames.mjs "${{ inputs.composition }}" | tail -1)
+          node -e "
+            const total=${total}, parts=Math.min(20, Math.max(1, ${{ inputs.parts }}));
+            const size=Math.ceil(total/parts), r=[];
+            for (let a=0, i=0; a<total; a+=size, i++) r.push({ i: String(i).padStart(2,'0'), a, b: Math.min(total, a+size)-1 });
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'ranges='+JSON.stringify(r)+'\n');
+            console.log(total+' frames ->', r.length, 'parts of', size);"
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: true
+      matrix:
+        range: ${{ fromJson(needs.plan.outputs.ranges) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}", cache: npm }
+      - run: npm ci
+      - name: Install Chrome dependencies
+        run: npx remotion browser ensure
+      - name: Render frames ${{ matrix.range.a }}-${{ matrix.range.b }}
+        # No GPU on hosted runners: swangle = SwiftShader WebGL. The world builds slowly in software, hence the timeout.
+        run: >
+          npx remotion render src/index.ts ${{ inputs.composition }} out/part_${{ matrix.range.i }}.mp4
+          --frames=${{ matrix.range.a }}-${{ matrix.range.b }}
+          --codec h264 --crf 16 --scale ${{ inputs.scale }}
+          --gl=swangle --timeout=300000 --concurrency=4 --muted
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part_${{ matrix.range.i }}
+          path: out/part_${{ matrix.range.i }}.mp4
+          retention-days: 1
+
+  merge:
+    needs: render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: part_*, path: parts, merge-multiple: true }
+      - name: Concatenate parts and mux audio
+        run: |
+          ls parts/part_*.mp4 | sort | sed "s#^#file '$PWD/#; s#\$#'#" > list.txt
+          ffmpeg -v error -f concat -safe 0 -i list.txt -c copy video.mp4
+          if [ -n "${{ inputs.audio }}" ] && [ -f "${{ inputs.audio }}" ]; then
+            ffmpeg -v error -i video.mp4 -i "${{ inputs.audio }}" -map 0:v -map 1:a -c:v copy -c:a aac -b:a 192k -shortest final.mp4
+          else
+            mv video.mp4 final.mp4
+          fi
+          ffprobe -v error -show_entries format=duration:stream=width,height,nb_frames -of compact final.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.composition }}
+          path: final.mp4
+          retention-days: 14
