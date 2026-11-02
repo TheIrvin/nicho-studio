@@ -77,6 +77,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { pattern: part_*, path: parts, merge-multiple: true }
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Concatenate parts and mux audio
         run: |
           ls parts/part_*.mp4 | sort | sed "s#^#file '$PWD/#; s#\$#'#" > list.txt
